@@ -2,13 +2,20 @@ const express = require("express");
 const mysql = require("mysql2");
 const cors = require("cors");
 const morgan = require("morgan");
+const http = require("http"); // Import HTTP module
+const WebSocket = require("ws"); // Import WebSocket module
 const { verifyToken, authorizeRoles } = require("./authMiddleware");// Import middleware
 require("dotenv").config();
+
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(morgan("combined")); // Enable request logging
+
+// Create HTTP Server for Express & WebSockets
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 
 // MySQL Database Connection
@@ -27,8 +34,74 @@ db.connect((err) => {
   console.log("✅ Connected to MySQL database!");
 });
 
+// 🔹 WebSocket Connection Handling
+wss.on("connection", (ws) => {
+  console.log("🔗 New WebSocket connection established");
+
+  ws.send(JSON.stringify({ message: "Welcome to SmartHealthcare Real-Time Updates!" }));
+
+  ws.on("message", (message) => {
+    try {
+      const data = JSON.parse(message);
+      console.log("📩 Received message from client:", data);
+    } catch (error) {
+      console.error("❌ WebSocket message error:", error.message);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("❌ WebSocket connection closed");
+  });
+});
+
+// ✅ Token Validation Endpoint
+app.get("/token/validate", verifyToken, (req, res) => {
+  res.json({
+    message: "Token is valid",
+    user: {
+      userId: req.user.userId,
+      role: req.user.role,
+    },
+  });
+});
+
+// 🔹 Function to Broadcast WebSocket Notifications
+const broadcast = (data) => {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(data));
+    }
+  });
+};
+
+// 🔹 Example: Send Notifications on New Appointments
+app.post("/appointments", verifyToken, authorizeRoles("Admin", "Doctor"), (req, res) => {
+  const { patient_id, doctor_id, appointment_date, reason } = req.body;
+
+  if (!patient_id || !doctor_id || !appointment_date || !reason) {
+    return res.status(400).json({ error: "All fields are required!" });
+  }
+
+  const sql = `INSERT INTO Appointments (patient_id, doctor_id, appointment_date, reason, status) VALUES (?, ?, ?, ?, 'Scheduled')`;
+  db.query(sql, [patient_id, doctor_id, appointment_date, reason], (err, result) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    const appointment_id = result.insertId;
+    const notification = {
+      type: "NEW_APPOINTMENT",
+      message: `📅 New appointment scheduled for Patient ${patient_id} with Doctor ${doctor_id} on ${appointment_date}`,
+      data: { appointment_id, patient_id, doctor_id, appointment_date, reason, status: "Scheduled" },
+    };
+
+    // Broadcast notification to all WebSocket clients
+    broadcast(notification);
+
+    res.status(201).json({ message: "Appointment scheduled successfully!", appointment_id });
+  });
+});
+
  
-// Protected Routes - Add Here   
+// Protected Routes - Add Here
 
 // Protect fetching patients - Only Admin and Doctor can access
 app.get("/patients", verifyToken, authorizeRoles("Admin", "Doctor"), (req, res) => {
@@ -41,8 +114,14 @@ app.get("/patients", verifyToken, authorizeRoles("Admin", "Doctor"), (req, res) 
 // Protect adding a new doctor - Only Admin can access
 app.post("/doctors", verifyToken, authorizeRoles("Admin"), (req, res) => {
   const { name, specialization, email, phone } = req.body;
+
+  if (!name || !specialization || !email || !phone) {
+    return res.status(400).json({ error: "All fields are required!" });
+  }
+
   const sql = "INSERT INTO Doctors (name, specialization, email, phone) VALUES (?, ?, ?, ?)";
   const values = [name, specialization, email, phone];
+
   db.query(sql, values, (err, result) => {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ message: "Doctor added successfully!", doctor_id: result.insertId });
@@ -52,21 +131,93 @@ app.post("/doctors", verifyToken, authorizeRoles("Admin"), (req, res) => {
 // Protect deleting appointments - Only Admin can access
 app.delete("/appointments/:id", verifyToken, authorizeRoles("Admin"), (req, res) => {
   const { id } = req.params;
+  
   db.query("DELETE FROM Appointments WHERE appointment_id = ?", [id], (err, result) => {
     if (err) return res.status(500).json({ error: err.message });
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: "Appointment not found!" });
+    }
+
     res.json({ message: "Appointment deleted successfully!" });
   });
 });
+// 🔹 **1. Search & Filter Patients**
+app.get("/patients/search", verifyToken, authorizeRoles("Admin", "Doctor"), (req, res) => {
+  const { name, email, phone } = req.query;
+  let sql = "SELECT * FROM Patients WHERE 1=1";
+  let values = [];
 
-// API Routes
+  if (name) {
+    sql += " AND name LIKE ?";
+    values.push(`%${name}%`);
+  }
+  if (email) {
+    sql += " AND email LIKE ?";
+    values.push(`%${email}%`);
+  }
+  if (phone) {
+    sql += " AND phone LIKE ?";
+    values.push(`%${phone}%`);
+  }
+
+  db.query(sql, values, (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(results);
+  });
+});
+
+// 🔹 **2. Search & Filter Doctors**
+app.get("/doctors/search", verifyToken, authorizeRoles("Admin", "Doctor"), (req, res) => {
+  const { name, specialization } = req.query;
+  let sql = "SELECT * FROM Doctors WHERE 1=1";
+  let values = [];
+
+  if (name) {
+    sql += " AND name LIKE ?";
+    values.push(`%${name}%`);
+  }
+  if (specialization) {
+    sql += " AND specialization LIKE ?";
+    values.push(`%${specialization}%`);
+  }
+
+  db.query(sql, values, (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(results);
+  });
+});
+
+// 🔹 **3. Filter Appointments by Date & Status**
+app.get("/appointments/filter", verifyToken, authorizeRoles("Admin", "Doctor"), (req, res) => {
+  const { date, status } = req.query;
+  let sql = "SELECT * FROM Appointments WHERE 1=1";
+  let values = [];
+
+  if (date) {
+    sql += " AND DATE(appointment_date) = ?";
+    values.push(date);
+  }
+  if (status) {
+    sql += " AND status = ?";
+    values.push(status);
+  }
+
+  db.query(sql, values, (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(results);
+  });
+});
+// API Root Route
 app.get("/", (req, res) => {
   res.json({ message: "SmartHealthcare API is running!" });
 });
 
-// Start Server
+// Start Server (HTTP + WebSockets)
 const PORT = 7070;
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`🔌 WebSocket Server running on ws://localhost:${PORT}`);
 });
 
 // Fetch all patients
@@ -143,10 +294,21 @@ app.post("/medical-records", (req, res) => {
 app.put("/patients/:id", (req, res) => {
   const { id } = req.params;
   const { name, email, phone, date_of_birth, gender, address } = req.body;
+
+  if (!name || !email || !phone || !date_of_birth || !gender || !address) {
+    return res.status(400).json({ error: "All fields are required" });
+  }
+
   const sql = `UPDATE Patients SET name = ?, email = ?, phone = ?, date_of_birth = ?, gender = ?, address = ? WHERE patient_id = ?`;
   const values = [name, email, phone, date_of_birth, gender, address, id];
+
   db.query(sql, values, (err, result) => {
     if (err) return res.status(500).json({ error: err.message });
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Patient not found" });
+    }
+
     res.json({ message: "Patient updated successfully!" });
   });
 });
@@ -173,21 +335,43 @@ app.put("/doctors/:id", (req, res) => {
 app.put("/appointments/:id", (req, res) => {
   const { id } = req.params;
   const { patient_id, doctor_id, appointment_date, status } = req.body;
-  const sql = `UPDATE Appointments SET patient_id = ?, doctor_id = ?, appointment_date = ?, status = ? WHERE appointment_id = ?`;
-  const values = [patient_id, doctor_id, appointment_date, status, id];
+
+  if (!status) {
+    return res.status(400).json({ error: "Status is required" });
+  }
+
+  const sql = `UPDATE Appointments SET status = ? WHERE appointment_id = ?`;
+  const values = [status, id];
+
   db.query(sql, values, (err, result) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: "Appointment updated successfully!" });
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Appointment not found" });
+    }
+
+    res.json({ message: "Appointment status updated successfully!" });
   });
 });
 
 app.put("/medical-records/:id", (req, res) => {
   const { id } = req.params;
   const { patient_id, doctor_id, diagnosis, prescription } = req.body;
-  const sql = `UPDATE MedicalRecords SET patient_id = ?, doctor_id = ?, diagnosis = ?, prescription = ? WHERE record_id = ?`;
-  const values = [patient_id, doctor_id, diagnosis, prescription, id];
+
+  if (!diagnosis || !prescription) {
+    return res.status(400).json({ error: "Diagnosis and prescription are required" });
+  }
+
+  const sql = `UPDATE MedicalRecords SET diagnosis = ?, prescription = ? WHERE record_id = ?`;
+  const values = [diagnosis, prescription, id];
+
   db.query(sql, values, (err, result) => {
     if (err) return res.status(500).json({ error: err.message });
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ message: "Medical record not found" });
+    }
+
     res.json({ message: "Medical record updated successfully!" });
   });
 });
@@ -224,17 +408,17 @@ app.delete("/medical-records/:id", (req, res) => {
     res.json({ message: "Medical record deleted successfully!" });
   });
 });
-
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 
-// 🔐 Secret for JWT (you can store this in a .env file for better security)
+// 🔐 Secret for JWT (You should store this in a .env file)
 const JWT_SECRET = process.env.JWT_SECRET || "supersecretkey";
 
 // ➡️ Register User (Signup)
 app.post("/register", async (req, res) => {
   const { name, email, password, role } = req.body;
 
+  // Validate input
   if (!name || !email || !password) {
     return res.status(400).json({ error: "All fields are required" });
   }
@@ -254,6 +438,7 @@ app.post("/register", async (req, res) => {
       }
       res.status(201).json({ message: "User registered successfully!" });
     });
+
   } catch (err) {
     res.status(500).json({ error: "Server error" });
   }
